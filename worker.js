@@ -1,8 +1,9 @@
-const SECRET_KEY = "Wang16766912a";
-const TELEGRAM_BOT_TOKEN = "8531922738:AAGtyd0MtG5zTj_Uez3HXL6XpSaKPt-aPu8";
-const CHAT_ID = ["7830249047"];
-const BUCKET_NAME = "tg-tuchuang";
-const BASE_URL = "https://t.mbe.cc";
+// 在这里修改你的配置
+const SECRET_KEY = "***你的Web后台访问密码***";
+const TELEGRAM_BOT_TOKEN = "***你的Telegram Bot Token***";
+const CHAT_ID = ["***允许访问的聊天ID***"];
+const BUCKET_NAME = "***你的R2存储桶绑定变量名***";
+const BASE_URL = "https://***你的访问域名***";
 const TELEGRAM_API_URL = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
 export default {
