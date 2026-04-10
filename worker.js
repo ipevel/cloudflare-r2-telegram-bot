@@ -1973,6 +1973,7 @@ async function handleWebUpload(request, bucket, baseUrl) {
 	}
 }
 
+async function handleListFiles(request, bucket) {
 	const {searchParams} = new URL(request.url);
 	const limit = parseInt(searchParams.get('limit')) || 20;
 	const cursor = searchParams.get('cursor') || undefined;
