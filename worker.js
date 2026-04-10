@@ -1934,8 +1934,10 @@ async function handleListFiles(request, bucket) {
 		hasMore: !!filesResult.cursor
 	}), {
 		headers: {'Content-Type': 'application/json'}
-	});
+});
 }
+
+async function handleDeleteFiles(request, bucket) {
 	try {
 		console.log("Request received");
 		const body = await request.json();
