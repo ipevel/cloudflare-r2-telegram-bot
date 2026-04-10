@@ -1937,9 +1937,6 @@ async function handleListFiles(request, bucket) {
 	});
 }
 			status: 500,
-
-
-async function handleDeleteFiles(request, bucket) {
 	try {
 		console.log("Request received");
 		const body = await request.json();
