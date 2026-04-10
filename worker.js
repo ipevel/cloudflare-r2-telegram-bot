@@ -76,7 +76,6 @@ export default {
 			if (path === '/gallery' || path === '/' || path === '') {
 				return serveGalleryPage();
 			}
-			}
 
 			return new Response('Not found', {status: 404});
 		} catch (err) {
