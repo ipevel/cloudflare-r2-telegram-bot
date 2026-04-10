@@ -44,14 +44,38 @@ export default {
 				return handleDeleteFolder(request, env[BUCKET_NAME]);
 			}
 
-			// Telegram bot routes
+			// Telegram set webhook
 			if (path === '/setWebhook') {
 				const webhookUrl = `${url.protocol}//${url.host}/webhook`;
 				const webhookResponse = await setWebhook(webhookUrl, TELEGRAM_API_URL);
 				if (webhookResponse.ok) {
 					return new Response(`Webhook set successfully to ${webhookUrl}`);
 				}
-				return new Response('Failed to set webhook', {status: 500});
+			}
+
+			// 代理访问R2中存储的图片文件
+			if (path !== '/' && path !== '/gallery' && path !== '/upload' && path !== '/login' && path !== '/webhook' && path !== '/setWebhook' && !path.startsWith('/api/')) {
+				// 尝试从R2获取文件直接返回
+				const bucket = env[BUCKET_NAME];
+				const object = await bucket.get(path.substring(1));
+				if (object !== null) {
+					// 找到了，返回文件
+					const headers = new Headers();
+					object.writeHttpMetadata(headers);
+					headers.set('Cache-Control', 'public, max-age=31536000');
+					return new Response(object.body, {
+						headers: headers
+					});
+				} else {
+					// 文件不存在，返回404
+					return new Response('Not Found', {status: 404});
+				}
+			}
+
+			// Serve the gallery page
+			if (path === '/gallery' || path === '/' || path === '') {
+				return serveGalleryPage();
+			}
 			}
 
 			return new Response('Not found', {status: 404});
