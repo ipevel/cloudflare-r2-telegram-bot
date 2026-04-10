@@ -1,6 +1,13 @@
 export default {
 	async fetch(request, env) {
-	
+
+		// 配置从环境变量读取
+		const SECRET_KEY = env.SECRET_KEY;
+		const TELEGRAM_BOT_TOKEN = env.TELEGRAM_BOT_TOKEN;
+		const CHAT_ID = (env.CHAT_ID || "").split(",").map(id => id.trim()).filter(id);
+		const BUCKET_NAME = env.BUCKET_NAME || "images";
+		const BASE_URL = env.BASE_URL;
+		const TELEGRAM_API_URL = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
 		const url = new URL(request.url);
 		const path = url.pathname;
