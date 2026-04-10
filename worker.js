@@ -44,6 +44,10 @@ export default {
 				return handleDeleteFolder(request, env[BUCKET_NAME]);
 			}
 
+			if (path === '/api/move' && request.method === 'POST' && await isAuthenticated(request, SECRET_KEY)) {
+				return handleMoveFiles(request, env[BUCKET_NAME]);
+			}
+
 			// Telegram set webhook
 			if (path === '/setWebhook') {
 				const webhookUrl = `${url.protocol}//${url.host}/webhook`;
@@ -1267,6 +1271,7 @@ function serveGalleryPage() {
             <div class="header-buttons">
                 <a href="/upload" class="btn">上传图片</a>
                 <button id="newFolderBtn" class="btn btn-secondary">新建文件夹</button>
+                <button id="moveBtn" class="btn" disabled>移动所选</button>
                 <button id="deleteBtn" class="btn btn-danger" disabled>删除所选</button>
             </div>
         </div>
@@ -1312,6 +1317,26 @@ function serveGalleryPage() {
         </div>
     </div>
 
+    <!-- 移动图片到文件夹模态框 -->
+    <div class="modal" id="moveModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>移动图片</h3>
+                <span class="close">&times;</span>
+            </div>
+            <div class="form-group">
+                <label for="targetFolder">目标文件夹</label>
+                <select id="targetFolder" class="form-control">
+                    <option value="">根目录（移出文件夹）</option>
+                </select>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary close-modal">取消</button>
+                <button id="confirmMoveBtn" class="btn">确认移动</button>
+            </div>
+        </div>
+    </div>
+
     <!-- 加载指示器 -->
     <div class="loading" id="loading">
         <div class="loading-spinner"></div>
@@ -1343,6 +1368,8 @@ function serveGalleryPage() {
             // 绑定事件
             document.getElementById('deleteBtn').addEventListener('click', deleteSelectedFiles);
             document.getElementById('newFolderBtn').addEventListener('click', () => showModal('folderModal'));
+            document.getElementById('moveBtn').addEventListener('click', () => showModal('moveModal'));
+            document.getElementById('confirmMoveBtn').addEventListener('click', moveSelectedFiles);
             document.getElementById('createFolderBtn').addEventListener('click', createFolder);
             document.getElementById('selectAllCheckbox').addEventListener('change', toggleSelectAll);
 
@@ -1579,6 +1606,24 @@ function serveGalleryPage() {
 
             // 显示或隐藏全选控件
             document.querySelector('.select-all-container').style.display = files.length > 0 ? 'flex' : 'none';
+
+            // 更新移动模态框的目标文件夹列表
+            updateMoveFolderOptions(directories);
+        }
+
+        // 更新移动模态框的目标文件夹列表
+        function updateMoveFolderOptions(directories) {
+            const select = document.getElementById('targetFolder');
+            // 清空原有选项，保留根目录
+            select.innerHTML = '<option value="">根目录（移出文件夹）</option>';
+            // 添加其他文件夹，排除当前路径下的文件夹不需要？不，所有根目录和上层文件夹都可以选
+            // 只需要排除当前所在文件夹
+            directories.forEach(dir => {
+                const option = document.createElement('option');
+                option.value = dir.path;
+                option.textContent = dir.name;
+                select.appendChild(option);
+            });
         }
 
         // 渲染分页控件
@@ -1748,7 +1793,9 @@ function serveGalleryPage() {
         // 更新删除按钮状态
         function updateDeleteButton() {
             const deleteBtn = document.getElementById('deleteBtn');
+            const moveBtn = document.getElementById('moveBtn');
             deleteBtn.disabled = selectedFiles.length === 0;
+            moveBtn.disabled = selectedFiles.length === 0;
         }
 
         // 删除选中的文件
@@ -1783,6 +1830,50 @@ function serveGalleryPage() {
             } catch (error) {
                 console.error('删除失败:', error);
                 showNotification('删除失败，请重试', true);
+            } finally {
+                showLoading(false);
+            }
+        }
+
+        // 移动选中的图片
+        async function moveSelectedFiles() {
+            if (selectedFiles.length === 0) return;
+
+            const targetSelect = document.getElementById('targetFolder');
+            const targetFolder = targetSelect.value;
+
+            showLoading(true);
+
+            try {
+                const response = await fetch('/api/move', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        'selectedFiles': selectedFiles,
+                        'targetFolder': targetFolder
+                    })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    const successCount = data.results.filter(r => r.success).length;
+                    showNotification(`移动成功：${successCount}/${selectedFiles.length} 个文件`);
+                    // 关闭模态框
+                    document.getElementById('moveModal').style.display = 'none';
+                    // 清空选中
+                    selectedFiles = [];
+                    updateDeleteButton();
+                    // 重新加载画廊
+                    await loadGallery();
+                } else {
+                    showNotification('移动失败：' + (data.error || '未知错误'), true);
+                }
+            } catch (error) {
+                console.error('移动失败:', error);
+                showNotification('移动失败，请重试', true);
             } finally {
                 showLoading(false);
             }
@@ -1921,16 +2012,31 @@ async function handleWebUpload(request, bucket, baseUrl) {
 
 		// Build file path with user prefix if provided
 		let key = `${formattedDate}_${shortUUID}.${detectedType.ext}`;
+		let finalBuffer = fileBuffer;
+		let finalMime = detectedType.mime;
+
 		if (path) {
 			// Ensure path has trailing slash
 			const formattedPath = path.endsWith('/') ? path : `${path}/`;
 			key = `${formattedPath}${key}`;
 		}
 
+		// 超过500KB自动压缩转WebP节省存储
+		if (fileBuffer.byteLength > 500 * 1024 && detectedType.ext !== 'webp' && detectedType.ext !== 'gif') {
+			const imgUrl = `data:${detectedType.mime};base64,${arrayBufferToBase64(fileBuffer)}`;
+			const webpResponse = await fetch(`https://workers.cloudflare.com/cdn-cgi/image/f=webp,q=80/${imgUrl}`);
+			if (webpResponse.ok) {
+				finalBuffer = await webpResponse.arrayBuffer();
+				finalMime = 'image/webp';
+				// 修改后缀名
+				key = key.replace(new RegExp(`\.${detectedType.ext}$`), '.webp');
+			}
+		}
+
 		// Upload to R2
-		await bucket.put(key, fileBuffer, {
+		await bucket.put(key, finalBuffer, {
 			httpMetadata: {
-				contentType: detectedType.mime
+				contentType: finalMime
 			}
 		});
 
@@ -1958,6 +2064,56 @@ async function handleWebUpload(request, bucket, baseUrl) {
 	}
 }
 
+// 移动选中图片到目标文件夹
+async function handleMoveFiles(request, bucket) {
+	try {
+		const {selectedFiles, targetFolder} = await request.json();
+		if (!selectedFiles || selectedFiles.length === 0) {
+			return new Response(JSON.stringify({success: false, message: '没有选中要移动的图片'}), {status: 400});
+		}
+
+		const results = [];
+		const formattedTargetPath = targetFolder ? 
+			(targetFolder.endsWith('/') ? targetFolder : `${targetFolder}/`) : 
+			'';
+
+		for (const fileKey of selectedFiles) {
+			// Get the file from R2
+			const object = await bucket.get(fileKey);
+			if (object === null) {
+				results.push({fileKey, success: false, error: 'File not found'});
+				continue;
+			}
+
+			// Get the file name without path
+			const fileName = fileKey.split('/').pop();
+			const newKey = formattedTargetPath ? `${formattedTargetPath}${fileName}` : fileName;
+
+			// Copy to new location
+			const blob = await object.arrayBuffer();
+			await bucket.put(newKey, blob, {
+				httpMetadata: {
+					contentType: object.httpMetadata.contentType
+				}
+			});
+
+			// Delete the old file
+			await bucket.delete(fileKey);
+			results.push({fileKey, newKey, success: true});
+		}
+
+		return new Response(JSON.stringify({
+			success: true,
+			results
+		}), {
+			headers: {'Content-Type': 'application/json'}
+		});
+	} catch (err) {
+		console.error('Move files error:', err);
+		return new Response(JSON.stringify({success: false, error: err.message}), {status: 500});
+	}
+}
+
 async function handleListFiles(request, bucket) {
 	const {searchParams} = new URL(request.url);
 	const limit = parseInt(searchParams.get('limit')) || 20;
@@ -1977,24 +2133,33 @@ async function handleListFiles(request, bucket) {
 		};
 	});
 
-	// Format files
-	const formattedFiles = (filesResult.objects || []).map(object => {
-		// Skip directory markers
-		if (object.key === prefix) {
-			return null;
-		}
-		const name = object.key.substring(prefix.length);
-		if (!name) return null;
+	// Format files and sort DESC by upload time (newest first)
+	const formattedFiles = (filesResult.objects || [])
+		.filter(object => {
+			// Skip directory markers
+			if (object.key === prefix) {
+				return false;
+			}
+			return true;
+		})
+		.sort((a, b) => {
+			// Sort by upload time descending, newest first
+			return new Date(b.uploaded) - new Date(a.uploaded);
+		})
+		.map(object => {
+			const name = object.key.substring(prefix.length);
+			if (!name) return null;
 
-		return {
-			name: name,
-			key: object.key,
-			size: object.size,
-			uploaded: object.uploaded,
-			type: 'file',
-			url: `${BASE_URL}/${encodeURIComponent(object.key)}`
-		};
-	}).filter(file => file !== null);
+			return {
+				name: name,
+				key: object.key,
+				size: object.size,
+				uploaded: object.uploaded,
+				type: 'file',
+				url: `${BASE_URL}/${encodeURIComponent(object.key)}`
+			};
+		})
+		.filter(file => file !== null);
 
 	return new Response(JSON.stringify({
 		files: formattedFiles,
@@ -2119,15 +2284,30 @@ async function uploadImageToR2(imageUrl, bucket, isDocument = false, userPath = 
 
 		// Build file path with user prefix if provided
 		let key = `${formattedDate}_${shortUUID}.${detectedType.ext}`;
+		let finalBuffer = buffer;
+		let finalMime = detectedType.mime;
+
 		if (userPath) {
 			// Ensure path format is correct (has trailing slash)
 			const formattedPath = userPath.endsWith('/') ? userPath : `${userPath}/`;
 			key = `${formattedPath}${key}`;
 		}
 
-		await bucket.put(key, buffer, {
+		// 超过500KB自动压缩转WebP节省存储
+		if (buffer.byteLength > 500 * 1024 && detectedType.ext !== 'webp' && detectedType.ext !== 'gif') {
+			const imgUrl = `data:${detectedType.mime};base64,${arrayBufferToBase64(buffer)}`;
+			const webpResponse = await fetch(`https://workers.cloudflare.com/cdn-cgi/image/f=webp,q=80/${imgUrl}`);
+			if (webpResponse.ok) {
+				finalBuffer = await webpResponse.arrayBuffer();
+				finalMime = 'image/webp';
+				// 修改后缀名
+				key = key.replace(new RegExp(`\\.${detectedType.ext}$`), '.webp');
+			}
+		}
+
+		await bucket.put(key, finalBuffer, {
 			httpMetadata: {
-				contentType: detectedType.mime
+				contentType: finalMime
 			},
 		});
 
