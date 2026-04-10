@@ -1936,7 +1936,6 @@ async function handleListFiles(request, bucket) {
 		headers: {'Content-Type': 'application/json'}
 	});
 }
-			status: 500,
 	try {
 		console.log("Request received");
 		const body = await request.json();
