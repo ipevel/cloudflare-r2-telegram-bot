@@ -138,17 +138,37 @@ async function handleTelegramWebhook(request, env, TELEGRAM_API_URL, CHAT_ID, BU
 			return new Response('Unauthorized access', {status: 403});
 		}
 
-		// Get functions for path management
+		// Get functions for path management (uses D1 database)
+		async function initDatabase(db) {
+			await db.exec(`
+				CREATE TABLE IF NOT EXISTS user_paths (
+					chat_id TEXT PRIMARY KEY,
+					current_path TEXT NOT NULL
+				);
+			`);
+		}
+
 		async function getUserPath(chatId) {
-			const path = await env.INDEXES_KV.get(chatId.toString());
+			await initDatabase(env.DB);
+			const result = await env.DB.prepare(
+				'SELECT current_path FROM user_paths WHERE chat_id = ?'
+			).bind(chatId.toString()).first();
+			
+			if (!result) {
+				return ''; // Default to root
+			}
+			const path = result.current_path;
 			if (path === '/') {
 				return '';
 			}
-			return path || ''; // Default to empty string (root path)
+			return path || '';
 		}
 
 		async function setUserPath(chatId, path) {
-			await env.INDEXES_KV.put(chatId.toString(), path);
+			await initDatabase(env.DB);
+			await env.DB.prepare(
+				'INSERT OR REPLACE INTO user_paths (chat_id, current_path) VALUES (?, ?)'
+			).bind(chatId.toString(), path).run();
 		}
 
 		// Handle media uploads
