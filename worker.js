@@ -1860,7 +1860,7 @@ function serveGalleryPage() {
 
                 if (data.success) {
                     const successCount = data.results.filter(r => r.success).length;
-                    showNotification(`移动成功：${successCount}/${selectedFiles.length} 个文件`);
+                    showNotification('移动成功：' + successCount + '/' + selectedFiles.length + ' 个文件');
                     // 关闭模态框
                     document.getElementById('moveModal').style.display = 'none';
                     // 清空选中
