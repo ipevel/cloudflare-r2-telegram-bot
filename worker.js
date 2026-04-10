@@ -1265,6 +1265,9 @@ function serveGalleryPage() {
         <div class="pagination" id="pagination">
             <!-- 分页将通过JavaScript动态加载 -->
         </div>
+        <div id="loadMoreContainer" class="load-more-container" style="text-align: center; margin-top: 20px; display: none;">
+            <button onclick="loadMore()" class="btn">加载更多</button>
+        </div>
     </div>
 
     <!-- 新建文件夹的模态框 -->
@@ -1339,42 +1342,84 @@ function serveGalleryPage() {
 			});
         });
 
+        let currentCursor = null;
+        let hasMore = false;
+        let isLoading = false;
+
         // 加载画廊内容
         async function loadGallery() {
             showLoading(true);
             try {
-                const apiUrl = '/api/list?prefix=' + encodeURIComponent(currentPath) + '&page=' + currentPage;
+                let apiUrl = '/api/list?prefix=' + encodeURIComponent(currentPath) + '&limit=20';
+                if (currentCursor) {
+                    apiUrl += '&cursor=' + encodeURIComponent(currentCursor);
+                }
                 const response = await fetch(apiUrl);
                 const data = await response.json();
 
-                if (data.success) {
-                    // 保存全部文件列表
-                    allFiles = data.files;
+                // 保存全部文件列表
+                allFiles = data.files;
 
-                    // 更新面包屑导航
-                    updateBreadcrumb();
+                // 更新面包屑导航
+                updateBreadcrumb();
 
-                    // 渲染文件夹和文件
-                    renderGallery(data.directories, data.files);
+                // 渲染文件夹和文件
+                renderGallery(data.prefix, data.files);
 
-                    // 更新分页
-                    if (data.pagination) {
-                        totalPages = data.pagination.totalPages;
-                        renderPagination(data.pagination);
-                    }
+                currentCursor = data.cursor;
+                hasMore = data.hasMore;
 
-                    // 重置选中状态
-                    selectedFiles = [];
-                    updateDeleteButton();
-                    document.getElementById('selectAllCheckbox').checked = false;
+                // 更新加载更多按钮
+                const loadMoreContainer = document.getElementById('loadMoreContainer');
+                if (hasMore) {
+                    loadMoreContainer.style.display = 'block';
                 } else {
-                    showNotification('加载失败，请重试', true);
+                    loadMoreContainer.style.display = 'none';
                 }
+
+                // 重置选中状态
+                selectedFiles = [];
+                updateDeleteButton();
+                document.getElementById('selectAllCheckbox').checked = false;
             } catch (error) {
                 console.error('加载失败:', error);
                 showNotification('加载失败，请重试', true);
             } finally {
                 showLoading(false);
+            }
+        }
+
+        // 加载更多
+        async function loadMore() {
+            if (!hasMore || isLoading) return;
+            isLoading = true;
+            try {
+                let apiUrl = '/api/list?prefix=' + encodeURIComponent(currentPath) + '&limit=20';
+                if (currentCursor) {
+                    apiUrl += '&cursor=' + encodeURIComponent(currentCursor);
+                }
+                const response = await fetch(apiUrl);
+                const data = await response.json();
+
+                // 添加更多文件
+                allFiles = allFiles.concat(data.files);
+                renderGallery(data.prefix, allFiles);
+
+                currentCursor = data.cursor;
+                hasMore = data.hasMore;
+
+                const loadMoreContainer = document.getElementById('loadMoreContainer');
+                if (!hasMore) {
+                    loadMoreContainer.style.display = 'none';
+                }
+
+                selectedFiles = [];
+                updateDeleteButton();
+            } catch (error) {
+                console.error('加载更多失败:', error);
+                showNotification('加载失败，请重试', true);
+            } finally {
+                isLoading = false;
             }
         }
 
@@ -1388,12 +1433,12 @@ function serveGalleryPage() {
             homeLink.href = '/gallery';
             homeLink.textContent = '首页';
             homeLink.dataset.path = '';
-            homeLink.addEventListener('click', (e) => {
-                e.preventDefault();
-                currentPath = '';
-                currentPage = 1;
-                loadGallery();
-            });
+                homeLink.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    currentPath = '';
+                    currentCursor = null;
+                    loadGallery();
+                });
             breadcrumb.appendChild(homeLink);
 
             // 如果当前不在首页，则添加路径
@@ -1429,12 +1474,12 @@ function serveGalleryPage() {
                     } else {
                         // Create a closure to capture the current path value
                         const currentPathValue = path;
-                        link.addEventListener('click', (e) => {
-                            e.preventDefault();
-                            currentPath = currentPathValue+"/";
-                            currentPage = 1;
-                            loadGallery();
-                        });
+                    link.addEventListener('click', (e) => {
+                        e.preventDefault();
+                        currentPath = currentPathValue+"/";
+                        currentCursor = null;
+                        loadGallery();
+                    });
                     }
                     breadcrumb.appendChild(link);
                 });
@@ -1452,7 +1497,7 @@ function serveGalleryPage() {
                 dirElement.className = 'item directory';
                 dirElement.addEventListener('click', () => {
                     currentPath = dir.path;
-                    currentPage = 1;
+                    currentCursor = null;
                     loadGallery();
                 });
 
