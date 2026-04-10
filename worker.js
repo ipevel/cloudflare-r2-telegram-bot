@@ -1,7 +1,8 @@
 export default {
 	async fetch(request, env) {
-
-		// 配置从环境变量读取
+		const url = new URL(request.url);
+		const path = url.pathname;
+		// 读取配置
 		const SECRET_KEY = env.SECRET_KEY;
 		const TELEGRAM_BOT_TOKEN = env.TELEGRAM_BOT_TOKEN;
 		const CHAT_ID = (env.CHAT_ID || "").split(",").map(id => id.trim()).filter(id);
@@ -9,16 +10,13 @@ export default {
 		const BASE_URL = env.BASE_URL;
 		const TELEGRAM_API_URL = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
-		const url = new URL(request.url);
-		const path = url.pathname;
-
 		try {
 			if (path === '/webhook' && request.method === 'POST') {
 				return handleTelegramWebhook(request, env, TELEGRAM_BOT_TOKEN, TELEGRAM_API_URL, CHAT_ID, BUCKET_NAME, BASE_URL);
 			}
 			// Web interface routes
 			if (path === '/login' && request.method === 'POST') {
-				return handleLogin(request, SECRET_KEY);
+				return handleLogin(request, env);
 			}
 			if (path === '/' || path === '/index.html') {
 				return serveLoginPage();
@@ -246,7 +244,8 @@ async function isAuthenticated(request, secretKey) {
 	return cookies.auth === hashKey(secretKey).replace(/=/g, '');
 }
 
-async function handleLogin(request, secretKey) {
+async function handleLogin(request, env) {
+	const secretKey = env.SECRET_KEY;
 	const formData = await request.formData();
 	const inputKey = formData.get('key');
 
