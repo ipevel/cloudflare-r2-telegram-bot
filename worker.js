@@ -1937,10 +1937,6 @@ async function handleListFiles(request, bucket) {
 	});
 }
 			status: 500,
-			headers: {'Content-Type': 'application/json'}
-		});
-	}
-}
 
 
 async function handleDeleteFiles(request, bucket) {
