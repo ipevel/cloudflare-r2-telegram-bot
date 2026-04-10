@@ -55,9 +55,10 @@ export default {
 
 			// 代理访问R2中存储的图片文件
 			if (path !== '/' && path !== '/gallery' && path !== '/upload' && path !== '/login' && path !== '/webhook' && path !== '/setWebhook' && !path.startsWith('/api/')) {
-				// 尝试从R2获取文件直接返回
+				// 尝试从R2获取文件直接返回，需要解码URL编码后的路径
 				const bucket = env[BUCKET_NAME];
-				const object = await bucket.get(path.substring(1));
+				const key = decodeURIComponent(path.substring(1));
+				const object = await bucket.get(key);
 				if (object !== null) {
 					// 找到了，返回文件
 					const headers = new Headers();
