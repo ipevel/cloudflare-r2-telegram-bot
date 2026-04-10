@@ -14,7 +14,7 @@ export default {
 
 		try {
 			if (path === '/webhook' && request.method === 'POST') {
-				return handleTelegramWebhook(request, env, TELEGRAM_API_URL, CHAT_ID, BUCKET_NAME, BASE_URL);
+				return handleTelegramWebhook(request, env, TELEGRAM_BOT_TOKEN, TELEGRAM_API_URL, CHAT_ID, BUCKET_NAME, BASE_URL);
 			}
 			// Web interface routes
 			if (path === '/login' && request.method === 'POST') {
@@ -130,7 +130,7 @@ function detectImageType(uint8Array) {
 	return null;
 }
 
-async function handleTelegramWebhook(request, env, TELEGRAM_API_URL, CHAT_ID, BUCKET_NAME, BASE_URL) {
+async function handleTelegramWebhook(request, env, TELEGRAM_BOT_TOKEN, TELEGRAM_API_URL, CHAT_ID, BUCKET_NAME, BASE_URL) {
 	try {
 		const update = await request.json();
 
