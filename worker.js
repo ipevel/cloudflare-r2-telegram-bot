@@ -1,11 +1,6 @@
-const SECRET_KEY = "asdfhkhktvdxcvwer";
-const TELEGRAM_BOT_TOKEN = "xxxxxxxxxxxxxxxxxxxxxxxx";
-const CHAT_ID = ["5xxxxxx63"];
-const BUCKET_NAME = "images";
-const BASE_URL = "https://xx.xx.xx";
 export default {
 	async fetch(request, env) {
-		const TELEGRAM_API_URL = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+	
 
 		const url = new URL(request.url);
 		const path = url.pathname;
@@ -38,6 +33,9 @@ export default {
 			}
 			if (path === '/api/create-folder' && request.method === 'POST' && await isAuthenticated(request, SECRET_KEY)) {
 				return handleCreateFolder(request, env[BUCKET_NAME]);
+			}
+			if (path === '/api/delete-folder' && request.method === 'POST' && await isAuthenticated(request, SECRET_KEY)) {
+				return handleDeleteFolder(request, env[BUCKET_NAME]);
 			}
 
 			// Telegram bot routes
@@ -97,7 +95,30 @@ function detectImageType(uint8Array) {
 		if (isPng) return {mime: 'image/png', ext: 'png'};
 	}
 
-	// Add more image type detection as needed (GIF, WebP, etc.)
+	// Check for GIF signature (GIF87a or GIF89a)
+	if (uint8Array.length >= 6) {
+		const gifHeader = String.fromCharCode(...uint8Array.slice(0, 6));
+		if (gifHeader === 'GIF87a' || gifHeader === 'GIF89a') {
+			return {mime: 'image/gif', ext: 'gif'};
+		}
+	}
+
+	// Check for WebP signature (RIFF followed with "WEBP")
+	if (uint8Array.length >= 12) {
+		const riffHeader = String.fromCharCode(...uint8Array.slice(0, 4));
+		const webpTag = String.fromCharCode(...uint8Array.slice(8, 12));
+		if (riffHeader === 'RIFF' && webpTag === 'WEBP') {
+			return {mime: 'image/webp', ext: 'webp'};
+		}
+	}
+
+	// Check for BMP
+	if (uint8Array.length >= 2) {
+		const bmpHeader = String.fromCharCode(...uint8Array.slice(0, 2));
+		if (bmpHeader === 'BM') {
+			return {mime: 'image/bmp', ext: 'bmp'};
+		}
+	}
 
 	return null;
 }
@@ -189,7 +210,7 @@ async function handleTelegramWebhook(request, env, TELEGRAM_API_URL, CHAT_ID, BU
 			const fileName = doc.file_name || '';
 			const fileExt = fileName.split('.').pop().toLowerCase();
 
-			if (!['jpg', 'jpeg', 'png'].includes(fileExt)) {
+			if (!['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(fileExt)) {
 				await sendMessage(chatId, '不支持的文件类型，请发送 JPG/PNG 格式文件', TELEGRAM_API_URL);
 				return new Response('OK');
 			}
@@ -374,6 +395,36 @@ function serveUploadPage() {
           background-color: #fbfbfd;
           color: #1d1d1f;
           min-height: 100vh;
+        }
+
+        .modal {
+
+          display: none;
+
+          position: fixed;
+
+          top: 0;
+
+          left: 0;
+
+          width: 100%;
+
+          height: 100%;
+
+          background-color: rgba(0, 0, 0, 0.9);
+
+          z-index: 9999;
+
+          align-items: center;
+
+          justify-content: center;
+
+        }
+
+        .modal.show {
+
+          display: flex;
+
         }
 
         header {
