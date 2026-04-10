@@ -1890,94 +1890,52 @@ async function handleWebUpload(request, bucket, baseUrl) {
 }
 
 async function handleListFiles(request, bucket) {
-	try {
-		const url = new URL(request.url);
-		const prefix = url.searchParams.get('prefix') || '';
-		const delimiter = '/';
+	const {searchParams} = new URL(request.url);
+	const limit = parseInt(searchParams.get('limit')) || 20;
+	const cursor = searchParams.get('cursor') || undefined;
+	const prefix = searchParams.get('prefix') || '';
+	const delimiter = '/';
 
-		// Get pagination parameters
-		const page = parseInt(url.searchParams.get('page') || '1', 10); // Default to page 1
-		const pageSize = parseInt(url.searchParams.get('pageSize') || '50', 10); // Default to 50 items per page
+	const filesResult = await bucket.list({prefix, delimiter, limit, cursor});
+	
+	// Format directories
+	const directories = (filesResult.delimitedPrefixes || []).map(delimitedPrefixes => {
+		const name = delimitedPrefixes.substring(prefix.length).replace(/\/$/, '');
+		return {
+			name: name,
+			path: delimitedPrefixes,
+			type: 'directory'
+		};
+	});
 
-		// List objects with the given prefix
-		const listResult = await bucket.list({
-			prefix: prefix,
-			delimiter: delimiter
-		});
-
-		// Format directories (commonPrefixes) and files (objects)
-		const directories = (listResult.delimitedPrefixes || []).map(delimitedPrefixes => {
-			const name = delimitedPrefixes.substring(prefix.length).replace(/\/$/, '');
-			return {
-				name: name,
-				path: delimitedPrefixes,
-				type: 'directory'
-			};
-		});
-
-		const files = (listResult.objects || []).map(object => {
-			// Skip objects that represent the current directory or are used as directory markers
-			if (object.key === prefix) {
-				return null;
-			}
-
-			// For actual files, extract just the filename from the full path
-			const name = object.key.substring(prefix.length);
-			if (!name) return null; // Skip if name is empty
-
-			return {
-				name: name,
-				key: object.key,
-				size: object.size,
-				uploaded: object.uploaded,
-				type: 'file',
-				url: `${BASE_URL}/${encodeURIComponent(object.key)}`
-			};
-		}).filter(file => file !== null);
-
-		// Implement pagination
-		const totalFiles = files.length;
-		const totalPages = Math.ceil(totalFiles / pageSize);
-
-		// Calculate starting index for the current page
-		const startIndex = (page - 1) * pageSize;
-		const endIndex = Math.min(startIndex + pageSize, totalFiles); // Ensure we don't exceed the array length
-		const filesOnPage = files.slice(startIndex, endIndex);
-
-		// Calculate parent directory path
-		let parentPath = '';
-		if (prefix) {
-			const parts = prefix.split('/');
-			parts.pop(); // Remove the last part (empty if prefix ends with /)
-			if (parts.length > 0) {
-				parts.pop(); // Remove the directory name
-				parentPath = parts.join('/');
-				if (parentPath) parentPath += '/';
-			}
+	// Format files
+	const formattedFiles = (filesResult.objects || []).map(object => {
+		// Skip directory markers
+		if (object.key === prefix) {
+			return null;
 		}
+		const name = object.key.substring(prefix.length);
+		if (!name) return null;
 
-		return new Response(JSON.stringify({
-			success: true,
-			currentPath: prefix,
-			parentPath: parentPath,
-			directories: directories,
-			files: filesOnPage,
-			pagination: {
-				currentPage: page,
-				pageSize: pageSize,
-				totalFiles: totalFiles,
-				totalPages: totalPages
-			}
-		}), {
-			headers: {'Content-Type': 'application/json'}
-		});
+		return {
+			name: name,
+			key: object.key,
+			size: object.size,
+			uploaded: object.uploaded,
+			type: 'file',
+			url: `${BASE_URL}/${encodeURIComponent(object.key)}`
+		};
+	}).filter(file => file !== null);
 
-	} catch (error) {
-		console.error('List files error:', error);
-		return new Response(JSON.stringify({
-			success: false,
-			message: 'Failed to list files'
-		}), {
+	return new Response(JSON.stringify({
+		files: formattedFiles,
+		prefix: directories,
+		cursor: filesResult.cursor,
+		hasMore: !!filesResult.cursor
+	}), {
+		headers: {'Content-Type': 'application/json'}
+	});
+}
 			status: 500,
 			headers: {'Content-Type': 'application/json'}
 		});
