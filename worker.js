@@ -417,7 +417,7 @@ async function handleTelegramWebhook(request, env, cfg) {
 
 				const fileUrl = await getFileUrl(fileId, cfg.botToken);
 				const userPath = await getUserPath(chatId);
-				const uploadResult = await uploadImageToR2(fileUrl, env[cfg.bucketName], isDocument, userPath);
+				const uploadResult = await uploadImageToR2(fileUrl, env[cfg.bucketName], isDocument, userPath, env);
 
 				if (uploadResult.ok) {
 					// key 可能含中文/空格（如"图片/xxx.jpg"），TG 服务器抓取前必须 percent-encode
@@ -4134,7 +4134,7 @@ async function handleStats(request, env, bucket) {
 	}
 }
 
-async function uploadImageToR2(imageUrl, bucket, isDocument = false, userPath = '') {
+async function uploadImageToR2(imageUrl, bucket, isDocument = false, userPath = '', env = null) {
 	try {
 		// 下载 TG 文件：偶发连接重置/超时，重试 3 次
 		let response;
@@ -4193,7 +4193,7 @@ async function uploadImageToR2(imageUrl, bucket, isDocument = false, userPath = 
 				contentType: detectedType.mime
 			},
 		});
-		await invalidateStatsCache(env).catch(() => {});
+		if (env) await invalidateStatsCache(env).catch(() => {});
 
 		return {ok: true, key};
 	} catch (error) {
