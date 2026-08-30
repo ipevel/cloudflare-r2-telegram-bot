@@ -433,7 +433,7 @@ async function handleTelegramWebhook(request, env, cfg) {
 						}
 					}
 				} else {
-					await sendMessage(chatId, uploadResult.message, apiUrl);
+					await sendMessage(chatId, `${uploadResult.message}${uploadResult.error ? '\n(错误码: ' + uploadResult.error + ')' : ''}`, apiUrl);
 				}
 			} catch (error) {
 				console.error('处理文件失败:', error);
@@ -4136,8 +4136,20 @@ async function handleStats(request, env, bucket) {
 
 async function uploadImageToR2(imageUrl, bucket, isDocument = false, userPath = '') {
 	try {
-		const response = await fetch(imageUrl);
-		if (!response.ok) throw new Error('下载文件失败');
+		// 下载 TG 文件：偶发连接重置/超时，重试 3 次
+		let response;
+		let lastDlErr;
+		for (let attempt = 0; attempt < 3; attempt++) {
+			try {
+				response = await fetch(imageUrl);
+				if (response.ok) break;
+				lastDlErr = new Error(`下载文件失败 (HTTP ${response.status})`);
+			} catch (e) {
+				lastDlErr = e;
+			}
+			await new Promise(r => setTimeout(r, 400 * (attempt + 1)));
+		}
+		if (!response || !response.ok) throw (lastDlErr || new Error('下载文件失败'));
 
 		const buffer = await response.arrayBuffer();
 
@@ -4189,20 +4201,32 @@ async function uploadImageToR2(imageUrl, bucket, isDocument = false, userPath = 
 		return {
 			ok: false,
 			error: 'SERVER_ERROR',
-			message: '文件上传失败，请稍后再试。'
+			message: `文件上传失败，请稍后再试。原因: ${(error && error.message) || 'unknown'}`
 		};
 	}
 }
 
 async function getFileUrl(fileId, botToken) {
-	const response = await fetch(
-		`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`
-	);
-	const data = await response.json();
-	if (!data.ok || !data.result || !data.result.file_path) {
-		throw new Error((data && data.description) || '获取文件下载地址失败');
+	// TG getFile 偶发 429/瞬时网络错误，重试 3 次（指数退避）
+	let lastErr;
+	for (let attempt = 0; attempt < 3; attempt++) {
+		try {
+			const response = await fetch(
+				`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`
+			);
+			const data = await response.json().catch(() => null);
+			if (data && data.ok && data.result && data.result.file_path) {
+				return `https://api.telegram.org/file/bot${botToken}/${data.result.file_path}`;
+			}
+			lastErr = new Error((data && data.description) || `getFile HTTP ${response.status}`);
+			// 400 类（file_id 无效）重试无意义，直接抛
+			if (data && !data.ok && response.status === 400) throw lastErr;
+		} catch (e) {
+			lastErr = e;
+		}
+		await new Promise(r => setTimeout(r, 400 * (attempt + 1)));
 	}
-	return `https://api.telegram.org/file/bot${botToken}/${data.result.file_path}`;
+	throw lastErr || new Error('获取文件下载地址失败');
 }
 
 async function sendMessage(chatId, text, apiUrl, options = {}) {
