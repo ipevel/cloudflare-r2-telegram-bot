@@ -420,12 +420,17 @@ async function handleTelegramWebhook(request, env, cfg) {
 				const uploadResult = await uploadImageToR2(fileUrl, env[cfg.bucketName], isDocument, userPath);
 
 				if (uploadResult.ok) {
-					const imageUrl = `${cfg.baseUrl}/${uploadResult.key}`;
-					const caption = `✅ 图片上传成功！\n直链\n<code>${escapeHtml(imageUrl)}</code>\nMarkdown\n<code>![img](${escapeHtml(imageUrl)})</code>`;
-					const sent = await sendPhoto(chatId, imageUrl, apiUrl, caption, {parse_mode: "HTML"});
-					// sendPhoto 失败（如 webp 直链不被识别为图片）时降级为文本消息
+					// key 可能含中文/空格（如"图片/xxx.jpg"），TG 服务器抓取前必须 percent-encode
+					const publicUrl = `${cfg.baseUrl}/${uploadResult.key.split('/').map(encodeURIComponent).join('/')}`;
+					const caption = `✅ 图片上传成功！\n直链\n<code>${escapeHtml(publicUrl)}</code>\nMarkdown\n<code>![img](${escapeHtml(publicUrl)})</code>`;
+					const sent = await sendPhoto(chatId, publicUrl, apiUrl, caption, {parse_mode: "HTML"});
+					// sendPhoto 失败（TG 抓图失败/webp 不识别等）时降级为文本消息（带重试）
 					if (!sent || !sent.ok) {
-						await sendMessage(chatId, `✅ 图片上传成功！\n直链：${imageUrl}\nMarkdown：![img](${imageUrl})`, apiUrl);
+						const ok2 = await sendMessageReliable(chatId, `✅ 图片上传成功！\n直链：${publicUrl}\nMarkdown：![img](${publicUrl})`, apiUrl);
+						if (!ok2) {
+							// 兜底：让用户明确知道图已保存，只是回显失败
+							await sendMessageReliable(chatId, `⚠️ 图片已成功保存到图床，但回显消息发送失败（TG 接口异常）。可到 Web 后台查看。`, apiUrl);
+						}
 					}
 				} else {
 					await sendMessage(chatId, uploadResult.message, apiUrl);
@@ -2473,7 +2478,7 @@ function serveGalleryPage() {
             showLoading(true);
             closeLightbox();
             try {
-                let apiUrl = '/api/list?prefix=' + encodeURIComponent(currentPath) + '&limit=20';
+                let apiUrl = '/api/list?prefix=' + encodeURIComponent(currentPath) + '&limit=20&all=1';
                 if (currentCursor) {
                     apiUrl += '&cursor=' + encodeURIComponent(currentCursor);
                 }
@@ -2519,7 +2524,7 @@ function serveGalleryPage() {
             if (!hasMore || isLoading) return;
             isLoading = true;
             try {
-                let apiUrl = '/api/list?prefix=' + encodeURIComponent(currentPath) + '&limit=20';
+                let apiUrl = '/api/list?prefix=' + encodeURIComponent(currentPath) + '&limit=20&all=1';
                 if (currentCursor) {
                     apiUrl += '&cursor=' + encodeURIComponent(currentCursor);
                 }
@@ -3543,33 +3548,60 @@ async function handleListFiles(request, bucket, baseUrl) {
 	//    利用 key 自带 YYYYMMDD 日期前缀做按天分桶；整天原子返回，杜绝丢页/重复）
 	const MAX_SCAN_DAYS = 30;      // 单次请求最多向前扫描的天数
 	const MAX_COLLECTED = 2000;    // 单次响应文件数上限（防超大页）
+	const MAX_ALL_LIMIT = 5000;    // all=1 聚合模式总上限
 	const collected = [];
+	// all=1：聚合模式 — 除当前目录外，把每个子文件夹的内容也按天倒序并入列表
+	// （修复：TG 上传落在"图片/"子文件夹后，根目录图库只显示根下文件，用户以为图片丢了）
+	const wantAll = searchParams.get('all') === '1';
+	if (wantAll) {
+		// all=1 独立路径：当前层文件（delimiter 模式自带）+ 每个子文件夹平铺 list，一次拿全，内存排序。
+		// 不走按天分桶/游标翻页（天数多时子请求爆炸 → 超时；跨文件夹翻页语义混乱）。
+		// 上限 MAX_COLLECTED（2000）保护；超大图库未来再分片。
+		const collected = [];
+		for (const object of dirsResult.objects) {
+			if (object.key.endsWith('/.null')) continue;
+			if (isTrashKey(object.key)) continue;
+			collected.push(object);
+		}
+		for (const dir of (dirsResult.delimitedPrefixes || []).slice(0, 20)) {
+			if (dir === TRASH_PREFIX || isTrashKey(dir)) continue;
+			let subCursor;
+			do {
+				const subPage = await bucket.list({prefix: dir, limit: 1000, cursor: subCursor});
+				for (const object of subPage.objects) {
+					if (object.key.endsWith('/.null')) continue;
+					collected.push(object);
+				}
+				subCursor = subPage.truncated ? subPage.cursor : undefined;
+			} while (subCursor && collected.length < MAX_ALL_LIMIT);
+		}
+		collected.sort((a, b) => new Date(b.uploaded) - new Date(a.uploaded));
+		const limited = collected.slice(0, MAX_ALL_LIMIT);
+		const formattedFiles = limited.map(object => {
+			const name = object.key.substring(folderPrefix.length);
+			return {
+				name: name,
+				key: object.key,
+				size: object.size,
+				uploaded: object.uploaded,
+				type: 'file',
+				url: `${baseUrl}/${encodeURIComponent(object.key)}`
+			};
+		});
+		return new Response(JSON.stringify({
+			files: formattedFiles,
+			prefix: directories,
+			cursor: null,
+			hasMore: false,
+			total: collected.length
+		}), {headers: {'Content-Type': 'application/json', 'Cache-Control': 'no-store'}});
+	}
 	let day = startDay;
 	let r2Cursor = resumeR2Cursor;
 	let scannedDays = 0;
 	let stopReason = 'floor';
 
-	while (true) {
-		const page = await bucket.list({prefix: folderPrefix + day, limit: 1000, cursor: r2Cursor});
-		for (const object of page.objects) {
-			if (object.key.endsWith('/.null')) continue; // 跳过文件夹占位标记
-			collected.push(object);
-		}
-		if (page.truncated) {
-			// 当天超过 1000 条，未扫完：记录日内续读游标
-			r2Cursor = page.cursor;
-			if (collected.length >= MAX_COLLECTED) { stopReason = 'limit'; break; }
-			continue;
-		}
-		// 当天已扫完，往前一天
-		r2Cursor = undefined;
-		day = prevDay(day);
-		scannedDays++;
-		if (collected.length >= limit || collected.length >= MAX_COLLECTED) { stopReason = 'limit'; break; }
-		if (scannedDays >= MAX_SCAN_DAYS) { stopReason = 'floor'; break; }
-	}
-
-	// 3) 扫满 30 天窗口仍不足一页：用"最旧 key 探针"决定回跳或收尾
+// 3) 扫满 30 天窗口仍不足一页：用"最旧 key 探针"决定回跳或收尾
 	//    （否则稀疏图库/很久没上传的用户会看到空列表）
 	let legacyMode = false;
 	let jumpTruncated = false;
@@ -4183,6 +4215,30 @@ async function sendMessage(chatId, text, apiUrl, options = {}) {
 			...options
 		}),
 	});
+}
+
+// 带重试的 sendMessage：返回是否确认送达（TG API ok:true）
+async function sendMessageReliable(chatId, text, apiUrl, options = {}) {
+	for (let attempt = 0; attempt < 3; attempt++) {
+		try {
+			const response = await fetch(`${apiUrl}/sendMessage`, {
+				method: 'POST',
+				headers: {'Content-Type': 'application/json'},
+				body: JSON.stringify({
+					chat_id: chatId,
+					text: text,
+					...options
+				}),
+			});
+			const data = await response.json().catch(() => null);
+			if (data && data.ok) return true;
+			// 429 限流：等 retry_after 再试
+			const retryAfter = data && data.parameters && data.parameters.retry_after;
+			if (retryAfter) await new Promise(r => setTimeout(r, Math.min(retryAfter, 5) * 1000));
+		} catch (e) { /* 网络异常，稍后重试 */ }
+		await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+	}
+	return false;
 }
 
 async function sendPhoto(chatId, photoUrl, apiUrl, caption = "", options = {}) {
