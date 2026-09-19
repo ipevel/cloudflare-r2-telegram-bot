@@ -10,12 +10,15 @@
 //   WEBHOOK_SECRET      （推荐）webhook 防伪随机串，任意 32+ 位随机字符
 // 以下常量仅作为未配置环境变量时的兜底（兼容旧部署，建议留空并全部用环境变量）
 // ============================================================
+// 兜底容器：仅为兼容「直接改源码填常量」的旧部署方式保留，默认全部为空。
+// 安全策略（fail-closed）：SECRET_KEY / TELEGRAM_BOT_TOKEN / BUCKET_NAME / BASE_URL
+// 任一缺失时 worker 直接拒绝服务（503），绝不回退到任何可预测的默认值。
 const FALLBACK = {
-	SECRET_KEY: "***你的Web后台访问密码***",
-	TELEGRAM_BOT_TOKEN: "***你的Telegram Bot Token***",
-	CHAT_ID: ["***允许访问的聊天ID***"],
-	BUCKET_NAME: "***你的R2存储桶绑定变量名***",
-	BASE_URL: "https://***你的访问域名***"
+	SECRET_KEY: "",
+	TELEGRAM_BOT_TOKEN: "",
+	CHAT_ID: [],
+	BUCKET_NAME: "",
+	BASE_URL: ""
 };
 
 const UPLOAD_MAX_BYTES = 25 * 1024 * 1024; // Web 上传大小上限（超限返回 413）
@@ -28,13 +31,28 @@ function getConfig(env) {
 	if (env.CHAT_ID !== undefined && env.CHAT_ID !== null && String(env.CHAT_ID).trim() !== '') {
 		chatIds = String(env.CHAT_ID).split(',').map(s => s.trim()).filter(Boolean);
 	}
+	const secretKey = String(env.SECRET_KEY || FALLBACK.SECRET_KEY || '').trim();
+	const botToken = String(env.TELEGRAM_BOT_TOKEN || FALLBACK.TELEGRAM_BOT_TOKEN || '').trim();
+	const bucketName = String(env.BUCKET_NAME || FALLBACK.BUCKET_NAME || '').trim();
+	const baseUrl = String(env.BASE_URL || FALLBACK.BASE_URL || '').trim().replace(/\/+$/, '');
+
+	// 安全：关键配置缺失时 fail-closed（不回退默认值），避免可预测的口令 / 令牌生效
+	const missing = [];
+	if (!secretKey) missing.push('SECRET_KEY');
+	if (!botToken) missing.push('TELEGRAM_BOT_TOKEN');
+	if (!bucketName) missing.push('BUCKET_NAME');
+	if (!baseUrl) missing.push('BASE_URL');
+
 	return {
-		secretKey: env.SECRET_KEY || FALLBACK.SECRET_KEY,
-		botToken: env.TELEGRAM_BOT_TOKEN || FALLBACK.TELEGRAM_BOT_TOKEN,
+		secretKey,
+		botToken,
 		chatIds,
-		bucketName: env.BUCKET_NAME || FALLBACK.BUCKET_NAME,
-		baseUrl: String(env.BASE_URL || FALLBACK.BASE_URL).replace(/\/+$/, ''),
-		webhookSecret: env.WEBHOOK_SECRET || ''
+		bucketName,
+		baseUrl,
+		webhookSecret: String(env.WEBHOOK_SECRET || ''),
+		configError: missing.length
+			? `缺少必要配置：${missing.join(' / ')}。请在 Worker 的 设置 → 变量 中配置（敏感项请选 Secret 类型）。`
+			: null
 	};
 }
 
@@ -89,16 +107,23 @@ function isTrashKey(key) {
 }
 
 export default {
-	async fetch(request, env) {
+	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
 		const path = url.pathname;
 		const cfg = getConfig(env);
+		// 安全：配置缺失时直接拒绝服务（fail-closed），不进入任何业务分支
+		if (cfg.configError) {
+			return new Response(cfg.configError, {
+				status: 503,
+				headers: {'Content-Type': 'text/plain; charset=utf-8'}
+			});
+		}
 		const bucket = env[cfg.bucketName];
 
 		try {
-			// Telegram webhook（配置了 WEBHOOK_SECRET 时强制校验请求头）
+			// Telegram webhook（必须校验请求头；未配置 WEBHOOK_SECRET 时 fail-closed）
 			if (path === '/webhook' && request.method === 'POST') {
-				return handleTelegramWebhook(request, env, cfg);
+				return handleTelegramWebhook(request, env, cfg, ctx);
 			}
 
 			// 退出登录
@@ -181,11 +206,18 @@ export default {
 			if (path !== '/' && !path.startsWith('/api/') && !reserved.includes(path)) {
 				const key = decodeKey(path.substring(1));
 				if (!key) return new Response('Not Found', {status: 404});
+				// 安全：系统保留前缀（回收站 __trash__/ 等）不可经公开直链读取，
+				// 否则「软删除」不具备任何隐私保护能力。
+				if (isTrashKey(key) || key.startsWith('__')) {
+					return new Response('Not Found', {status: 404});
+				}
 				const object = await bucket.get(key);
 				if (object !== null) {
 					const headers = new Headers();
 					object.writeHttpMetadata(headers);
-					headers.set('Cache-Control', 'public, max-age=31536000');
+					// key 含随机段且内容不可变 → 可长期强缓存
+					headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+					headers.set('X-Content-Type-Options', 'nosniff');
 					return new Response(object.body, {headers: headers});
 				}
 				return new Response('Not Found', {status: 404});
@@ -202,15 +234,26 @@ export default {
 	// 未配置 trigger 时永远不会被调用，不影响 Dashboard 粘贴部署。
 	async scheduled(event, env, ctx) {
 		const cfg = getConfig(env);
+		if (cfg.configError) {
+			console.error('Cron 跳过：' + cfg.configError);
+			return;
+		}
 		const bucket = env[cfg.bucketName];
 		if (!bucket) return;
 		const cutoff = Date.now() - TRASH_RETENTION_DAYS * 86400000;
 		const expired = [];
 		let r2Cursor;
 		do {
-			const page = await bucket.list({prefix: TRASH_PREFIX, limit: 1000, cursor: r2Cursor});
+			// 必须 include customMetadata：对象进回收站后 uploaded 仍是「原图上传时间」
+			// （R2 copy 保留源对象时间戳），用它判断保留期会把刚删除的旧图立即清掉。
+			const page = await bucket.list({
+				prefix: TRASH_PREFIX, limit: 1000, cursor: r2Cursor, include: ['customMetadata']
+			});
 			for (const object of page.objects) {
-				if (object.uploaded && new Date(object.uploaded).getTime() < cutoff) {
+				const deletedAt = parseInt((object.customMetadata || {}).deletedAt) || 0;
+				// 兼容历史数据：无 deletedAt 的老对象退回 uploaded（与旧行为一致）
+				const ref = deletedAt || (object.uploaded ? new Date(object.uploaded).getTime() : 0);
+				if (ref && ref < cutoff) {
 					expired.push(object.key);
 				}
 			}
@@ -357,45 +400,76 @@ function detectImageType(uint8Array) {
 	return null;
 }
 
-async function handleTelegramWebhook(request, env, cfg) {
+async function handleTelegramWebhook(request, env, cfg, ctx) {
+	// 安全：没有 WEBHOOK_SECRET 就无法校验请求来源，直接拒绝（fail-closed）。
+	// 否则任何人 POST 一个伪造的 Telegram update 都可以驱使 bot 发言 / 改上传目录。
+	if (!cfg.webhookSecret) {
+		return new Response('webhook 未启用防伪校验：请配置 WEBHOOK_SECRET 环境变量', {status: 503});
+	}
+
+	// webhook 防伪造：校验 Telegram 回传的请求头
+	const sig = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
+	if (sig !== cfg.webhookSecret) {
+		// 自愈（无损切换）：部署新代码并配置 SECRET 后、但还未重跑 /setWebhook 时，
+		// Telegram 仍用旧密钥（或不带密钥）回调，这里自动重新注册一次 webhook。
+		// KV 节流 1 小时，防止被恶意请求反复触发对 Telegram API 的调用。
+		try {
+			const throttleKey = 'webhook:heal:last';
+			const last = parseInt(await env.INDEXES_KV.get(throttleKey)) || 0;
+			if (Date.now() - last > 3600 * 1000) {
+				await env.INDEXES_KV.put(throttleKey, String(Date.now()), {expirationTtl: 3700});
+				const webhookUrl = new URL(request.url);
+				webhookUrl.pathname = '/webhook';
+				webhookUrl.search = '';
+				await setWebhook(webhookUrl.toString(), cfg);
+			}
+		} catch (healError) {
+			console.error('Webhook self-heal failed:', healError);
+		}
+		return new Response('Forbidden', {status: 403});
+	}
+
+	// 关键：Telegram 要求 webhook 尽快返回 200，否则会重投同一个 update，
+	// 而每次上传都会生成新 key，重投将导致同一张图落盘两份。
+	// 因此这里只解析 body 并立即回 200，真正的上传 / 回复交给 waitUntil 异步执行。
+	let update;
+	try {
+		update = await request.json();
+	} catch (parseErr) {
+		return new Response('OK'); // body 非法也回 200，避免 Telegram 无谓重投
+	}
+
+	const task = processTelegramUpdate(update, env, cfg);
+	if (ctx && typeof ctx.waitUntil === 'function') {
+		ctx.waitUntil(task.catch(err => console.error('TG update 处理失败:', err)));
+	} else {
+		// 无 ctx 的降级路径：等待完成但吞掉异常，保证对外仍是 200
+		try { await task; } catch (err) { console.error('TG update 处理失败:', err); }
+	}
+	return new Response('OK');
+}
+
+// Telegram update 业务处理：异常一律内部消化，绝不向 Telegram 抛错（避免触发重投）
+async function processTelegramUpdate(update, env, cfg) {
 	const apiUrl = telegramApiUrl(cfg);
 	try {
-		// webhook 防伪造：配置了 WEBHOOK_SECRET 时校验 Telegram 回传的请求头
-		if (cfg.webhookSecret) {
-			const sig = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
-			if (sig !== cfg.webhookSecret) {
-				// 自愈（无损切换）：部署新代码并配置 SECRET 后、但还未重跑 /setWebhook 时，
-				// Telegram 仍用旧密钥（或不带密钥）回调，这里自动重新注册一次 webhook。
-				// KV 节流 1 小时，防止被恶意请求反复触发对 Telegram API 的调用。
-				try {
-					const throttleKey = 'webhook:heal:last';
-					const last = parseInt(await env.INDEXES_KV.get(throttleKey)) || 0;
-					if (Date.now() - last > 3600 * 1000) {
-						await env.INDEXES_KV.put(throttleKey, String(Date.now()), {expirationTtl: 3700});
-						const webhookUrl = new URL(request.url);
-						webhookUrl.pathname = '/webhook';
-						webhookUrl.search = '';
-						await setWebhook(webhookUrl.toString(), cfg);
-					}
-				} catch (healError) {
-					console.error('Webhook self-heal failed:', healError);
-				}
-				return new Response('Forbidden', {status: 403});
+		if (!update || !update.message) return;
+
+		// 幂等：同一个 update_id 只处理一次（TG 超时重投时避免同一张图落盘两份）
+		if (update.update_id !== undefined && update.update_id !== null) {
+			const dedupKey = `tg:update:${update.update_id}`;
+			try {
+				if (await env.INDEXES_KV.get(dedupKey)) return;
+				await env.INDEXES_KV.put(dedupKey, '1', {expirationTtl: 300});
+			} catch (kvErr) {
+				console.error('TG 幂等标记写入失败（继续处理）:', kvErr);
 			}
-		}
-
-		const update = await request.json();
-
-		if (!update.message) {
-			return new Response('OK');
 		}
 
 		const chatId = update.message.chat.id;
 
 		// Check if user is authorized
-		if (!cfg.chatIds.includes(chatId.toString())) {
-			return new Response('Unauthorized access', {status: 403});
-		}
+		if (!cfg.chatIds.includes(chatId.toString())) return;
 
 		// Get functions for path management
 		async function getUserPath(chatId) {
@@ -462,7 +536,7 @@ async function handleTelegramWebhook(request, env, cfg) {
 				} else {
 					await sendMessage(chatId, '请指定路径，例如：/modify blog', apiUrl);
 				}
-				return new Response('OK');
+				return;
 			}
 
 			// Handle /status command
@@ -470,13 +544,13 @@ async function handleTelegramWebhook(request, env, cfg) {
 				const currentPath = await getUserPath(chatId);
 				const statusMessage = currentPath ? `当前路径: ${currentPath}` : '当前路径: / (默认)';
 				await sendMessage(chatId, statusMessage, apiUrl);
-				return new Response('OK');
+				return;
 			}
 
 			// Default message for any other text
 			let mes = `请发送一张图片！\n或者使用以下命令：\n/modify 修改上传图片的存储路径\n/status 查看当前上传图片的路径`;
 			await sendMessage(chatId, mes, apiUrl);
-			return new Response('OK');
+			return;
 		}
 
 		// Handle document files
@@ -487,24 +561,24 @@ async function handleTelegramWebhook(request, env, cfg) {
 
 			if (!['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(fileExt)) {
 				await sendMessage(chatId, '不支持的文件类型，请发送 JPG/PNG/GIF/WebP/BMP 格式文件', apiUrl);
-				return new Response('OK');
+				return;
 			}
 
 			await handleMediaUpload(chatId, doc.file_id, true);
-			return new Response('OK');
+			return;
 		}
 
 		// Handle photos
 		if (update.message.photo) {
 			const fileId = update.message.photo.slice(-1)[0].file_id;
 			await handleMediaUpload(chatId, fileId);
-			return new Response('OK');
+			return;
 		}
 
-		return new Response('OK');
+		return;
 	} catch (err) {
-		console.error(err);
-		return new Response('Error processing request', {status: 500});
+		// 异常不向 Telegram 抛错：返回 5xx 会让 TG 重投，造成重复处理
+		console.error('TG update 处理异常:', err);
 	}
 }
 
@@ -1147,6 +1221,12 @@ function serveUploadPage() {
           const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'];
           const COMPRESSIBLE = ['image/jpeg', 'image/png', 'image/bmp'];
           const COMPRESS_THRESHOLD = 500 * 1024;
+          // 仅当源图长边超过该值才降采样（用于拦截手机直出等超标源图）。
+          // 实测：把 3840px 源图强行压到 2560px，在 1200px 显示尺寸下反而掉 2.9dB，
+          // 故不做「一律限制分辨率」，只拦住真正超标的图。
+          const MAX_EDGE = 3840;
+          // 高保真质量档：实测率失真曲线膝点在 0.86~0.88（0.90 之后边际增益腰斩）。
+          const WEBP_QUALITY = 0.88;
 
           // 待上传条目：{ file, previewUrl, compressedFrom }
           let selectedFiles = [];
@@ -1235,7 +1315,8 @@ function serveUploadPage() {
               if (entry.compressedFrom > 0) {
                 const note = document.createElement('span');
                 note.className = 'preview-note';
-                note.textContent = formatSize(entry.compressedFrom) + ' → ' + formatSize(entry.file.size);
+                note.textContent = formatSize(entry.compressedFrom) + ' → ' + formatSize(entry.file.size)
+                  + (entry.compressInfo ? '（' + entry.compressInfo + '）' : '');
                 item.appendChild(note);
               }
 
@@ -1262,47 +1343,103 @@ function serveUploadPage() {
             return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
           }
 
-          // P0-1 方案 A：>500KB 的可压缩格式在浏览器端转 WebP（服务端不再做转换）
-          // P2-7：createImageBitmap 指定 imageOrientation: 'from-image' 顺带修正 EXIF 方向
+          // 高保真 WebP 压缩（参数依据：项目评审报告 evidence/rd-curve.json 实测）
+          //  · 能力探测：老 Safari 的 toBlob('image/webp') 可能返回 null / PNG
+          //  · 内容分型：含透明的 PNG 保留原图，避免文字与图形边缘出现彩色镶边
+          //  · 尺寸钳制：仅当长边 > MAX_EDGE 时降采样（拦手机直出等超标源图）
+          //  · 失败回退：任何异常都上传原图，绝不让压缩导致上传失败
+          let _webpEncodeOK = null;
+          async function hasWebpEncode() {
+            if (_webpEncodeOK !== null) return _webpEncodeOK;
+            try {
+              const probe = makeCanvas(2, 2);
+              probe.getContext('2d').fillRect(0, 0, 2, 2);
+              const b = await canvasToBlob(probe, 'image/webp', 0.8);
+              _webpEncodeOK = !!b && b.type === 'image/webp';
+            } catch (e) {
+              _webpEncodeOK = false;
+            }
+            return _webpEncodeOK;
+          }
+
+          function makeCanvas(w, h) {
+            if (typeof OffscreenCanvas !== 'undefined') return new OffscreenCanvas(w, h);
+            const c = document.createElement('canvas');
+            c.width = w; c.height = h;
+            return c;
+          }
+
+          function canvasToBlob(canvas, type, quality) {
+            if (canvas.convertToBlob) return canvas.convertToBlob({ type: type, quality: quality });
+            return new Promise(function (resolve) { canvas.toBlob(resolve, type, quality); });
+          }
+
+          // 是否含透明像素（PNG 图标 / 透明底图转有损 WebP 会产生脏边，应保留原图）
+          async function hasAlphaChannel(bitmap) {
+            try {
+              const c = makeCanvas(8, 8);
+              const cx = c.getContext('2d');
+              cx.drawImage(bitmap, 0, 0, 8, 8);
+              const d = cx.getImageData(0, 0, 8, 8).data;
+              for (let i = 3; i < d.length; i += 4) {
+                if (d[i] !== 255) return true;
+              }
+            } catch (e) { /* 取像素失败按不透明处理 */ }
+            return false;
+          }
+
+          function clampEdge(w, h, cap) {
+            const long = Math.max(w, h);
+            if (long <= cap) return { w: w, h: h };
+            const s = cap / long;
+            return { w: Math.max(1, Math.round(w * s)), h: Math.max(1, Math.round(h * s)) };
+          }
+
           async function maybeCompress(entry) {
             const file = entry.file;
             const type = (file.type || '').toLowerCase();
             if (file.size <= COMPRESS_THRESHOLD || COMPRESSIBLE.indexOf(type) === -1) return entry;
             if (typeof createImageBitmap !== 'function') return entry;
+            if (!(await hasWebpEncode())) return entry;
+
             let bitmap = null;
             try {
+              // imageOrientation: 'from-image' 会把 EXIF 方向烘焙进像素（顺带摆正图片，
+              // 且 canvas 重编码天然剥离 EXIF，GPS 等隐私信息不会外泄）
               bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
             } catch (err1) {
               try { bitmap = await createImageBitmap(file); } catch (err2) { return entry; }
             }
+
+            const W = bitmap.width, H = bitmap.height;
             try {
-              const w = bitmap.width, h = bitmap.height;
-              const blob = await canvasToWebp(bitmap, w, h);
+              // 含透明的 PNG 保留原文件：canvas 无法可靠请求无损 WebP，
+              // 而有损编码会让图标 / 文字边缘变脏，保留 PNG 更稳妥。
+              if (type === 'image/png' && await hasAlphaChannel(bitmap)) return entry;
+
+              const dim = clampEdge(W, H, MAX_EDGE);
+              const canvas = makeCanvas(dim.w, dim.h);
+              const ctx = canvas.getContext('2d');
+              ctx.imageSmoothingEnabled = true;
+              ctx.imageSmoothingQuality = 'high';
+              ctx.drawImage(bitmap, 0, 0, dim.w, dim.h);
+              const blob = await canvasToBlob(canvas, 'image/webp', WEBP_QUALITY);
               if (bitmap.close) bitmap.close();
+
               if (blob && blob.size > 0 && blob.size < file.size) {
                 const newName = file.name.replace(/\\.[^.]+$/, '') + '.webp';
                 return {
                   file: new File([blob], newName, { type: 'image/webp' }),
                   previewUrl: entry.previewUrl,
-                  compressedFrom: file.size
+                  compressedFrom: file.size,
+                  compressInfo: W + '×' + H + ' → ' + dim.w + '×' + dim.h + ' · q' + WEBP_QUALITY
                 };
               }
             } catch (err) {
-              // 解码/编码失败时回退上传原图
+              // 解码 / 编码失败时回退上传原图
             }
+            if (bitmap && bitmap.close) bitmap.close();
             return entry;
-          }
-
-          async function canvasToWebp(source, w, h) {
-            if (typeof OffscreenCanvas !== 'undefined') {
-              const canvas = new OffscreenCanvas(w, h);
-              canvas.getContext('2d').drawImage(source, 0, 0);
-              return await canvas.convertToBlob({ type: 'image/webp', quality: 0.8 });
-            }
-            const canvas = document.createElement('canvas');
-            canvas.width = w; canvas.height = h;
-            canvas.getContext('2d').drawImage(source, 0, 0);
-            return await new Promise(resolve => canvas.toBlob(resolve, 'image/webp', 0.8));
           }
 
           // 上传队列：3 路并发、XHR 单文件进度、失败可重试
@@ -1366,7 +1503,7 @@ function serveUploadPage() {
                 try { data = JSON.parse(xhr.responseText); } catch (e) {}
                 if (xhr.status >= 200 && xhr.status < 300 && data.success) {
                   setItemProgress(idx, 100);
-                  resolve({ entry: entry, ok: true, key: data.key, url: data.url, name: entry.file.name, size: entry.file.size, compressedFrom: entry.compressedFrom });
+                  resolve({ entry: entry, ok: true, key: data.key, url: data.url, name: entry.file.name, size: entry.file.size, compressedFrom: entry.compressedFrom, compressInfo: entry.compressInfo });
                 } else {
                   setItemFailed(idx);
                   resolve({ entry: entry, ok: false, name: entry.file.name, message: data.message || ('上传失败 (' + xhr.status + ')') });
@@ -1502,7 +1639,7 @@ function serveUploadPage() {
                 const h3 = document.createElement('h3');
                 let title = result.name;
                 if (result.compressedFrom > 0) {
-                  title += '（已压缩 ' + formatSize(result.compressedFrom) + ' → ' + formatSize(result.size || 0) + '）';
+                  title += '（已压缩 ' + formatSize(result.compressedFrom) + ' → ' + formatSize(result.size || 0) + (result.compressInfo ? ' · ' + result.compressInfo : '') + '）';
                 }
                 h3.textContent = title;
                 item.appendChild(h3);
@@ -2881,9 +3018,9 @@ function serveGalleryPage() {
 
         // 删除文件夹（二次确认：confirm + 输入文件夹名）
         async function deleteFolder(dir) {
-            const sure = confirm('确定删除文件夹「' + dir.name + '」吗？\\n文件夹内的所有内容（包括子文件夹与图片）将被永久删除！');
+            const sure = confirm('确定删除文件夹「' + dir.name + '」吗？\\n文件夹内的所有内容（含子文件夹与图片）将移入回收站，可在回收站恢复。');
             if (!sure) return;
-            const typed = prompt('此操作不可恢复！\\n请输入文件夹名称 ' + dir.name + ' 以确认：');
+            const typed = prompt('请输入文件夹名称 ' + dir.name + ' 以确认删除（内容将移入回收站，可恢复）：');
             if (typed !== dir.name) {
                 showNotification('名称不匹配，已取消删除', true);
                 return;
@@ -3489,7 +3626,9 @@ async function handleWebUpload(request, env, bucket, cfg) {
 		// Upload to R2（不做服务端格式转换：>500KB 的压缩已由浏览器完成，见 P0-1 方案 A）
 		await bucket.put(key, fileBuffer, {
 			httpMetadata: {
-				contentType: detectedType.mime
+				contentType: detectedType.mime,
+				// key 含随机段、内容不可变：写入长期强缓存指令，配合 R2 自定义域可直接命中边缘缓存
+				cacheControl: 'public, max-age=31536000, immutable'
 			}
 		});
 		await invalidateStatsCache(env);
@@ -3731,7 +3870,8 @@ async function handleDeleteFiles(request, env, bucket) {
 					movedIn.push(key);
 					continue;
 				}
-				await bucket.copy(TRASH_PREFIX + key, key);
+				// 记录入回收站时间：Cron 清理以此为准（R2 copy 会保留源 uploaded 时间戳）
+				await bucket.copy(TRASH_PREFIX + key, key, {customMetadata: {deletedAt: String(Date.now())}});
 				const verify = await bucket.head(TRASH_PREFIX + key);
 				if (!verify) throw new Error('copy verify failed');
 				movedIn.push(key);
@@ -3994,15 +4134,48 @@ async function handleDeleteFolder(request, env, bucket) {
 			}
 		} while (r2Cursor);
 
-		// R2 binding 支持单次最多 1000 key 的批量删除
-		for (let i = 0; i < allKeys.length; i += 1000) {
-			await bucket.delete(allKeys.slice(i, i + 1000));
+		// 与单文件删除保持一致：默认进回收站（可恢复），避免误删整个目录不可逆。
+		// 需要直接清空时可传 permanent=true。
+		const permanent = body.permanent === true;
+		if (permanent) {
+			for (let i = 0; i < allKeys.length; i += 1000) {
+				await bucket.delete(allKeys.slice(i, i + 1000));
+			}
+			await invalidateStatsCache(env);
+			return jsonOk({
+				message: `文件夹已彻底删除（共 ${allKeys.length} 项）`,
+				deletedCount: allKeys.length
+			});
 		}
+
+		// 软删除：逐个 copy 进回收站（带 deletedAt），成功后再批量删原件
+		const movedIn = [];
+		const failed = [];
+		for (const key of allKeys) {
+			try {
+				await bucket.copy(TRASH_PREFIX + key, key, {customMetadata: {deletedAt: String(Date.now())}});
+				const verify = await bucket.head(TRASH_PREFIX + key);
+				if (!verify) throw new Error('copy verify failed');
+				movedIn.push(key);
+			} catch (e) {
+				failed.push({key: key, message: String((e && e.message) || 'move to trash failed')});
+			}
+		}
+
+		for (let i = 0; i < movedIn.length; i += 1000) {
+			await bucket.delete(movedIn.slice(i, i + 1000));
+		}
+		// 删除失败的原件：撤回回收站副本，避免产生重复占用
+		await Promise.allSettled(failed.map(f => bucket.delete(TRASH_PREFIX + f.key)));
 		await invalidateStatsCache(env);
 
 		return jsonOk({
-			message: `文件夹已删除（共 ${allKeys.length} 项）`,
-			deletedCount: allKeys.length
+			message: failed.length === 0
+				? `文件夹已移入回收站（共 ${movedIn.length} 项，可在回收站恢复）`
+			: `文件夹已移入回收站 ${movedIn.length} 项，${failed.length} 项失败`,
+			deletedCount: movedIn.length,
+			softDeleted: true,
+			failed: failed
 		});
 	} catch (error) {
 		console.error('Delete folder error:', error);
@@ -4190,7 +4363,8 @@ async function uploadImageToR2(imageUrl, bucket, isDocument = false, userPath = 
 		// 是 >500KB 上传必崩的根因；TG 发送的 photo 本身已经过 Telegram 压缩）
 		await bucket.put(key, buffer, {
 			httpMetadata: {
-				contentType: detectedType.mime
+				contentType: detectedType.mime,
+				cacheControl: 'public, max-age=31536000, immutable'
 			},
 		});
 		if (env) await invalidateStatsCache(env).catch(() => {});
